@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// rules.go defines [AddrSpec], [Command], [Request], [RuleSet], and the
-// built-in implementations [PermitAll] and [PermitCommand].
-//
-// Most servers don't need a custom [RuleSet]; the default ([PermitAll]) permits
-// every request. Use [PermitCommand] to restrict commands. Implement [RuleSet]
-// for IP-based, user-based, or destination-based access control.
+// rules.go retains the protocol-level types [AddrSpec] and [Command].
+// The rule-set system was removed in favour of the single
+// [Config.AllowPrivateDestinations] flag: the only meaningful policy
+// distinction for a SOCKS5 proxy is whether private/internal destinations
+// are reachable, which is a deployment characteristic, not per-request logic.
 package socks5
 
 import (
-	"context"
 	"net"
 	"net/netip"
 	"strconv"
@@ -51,56 +49,3 @@ const (
 	CommandBind         Command = 0x02 // not implemented; rejected with reply 0x07
 	CommandUDPAssociate Command = 0x03
 )
-
-// Request holds the information about an incoming SOCKS5 request presented to
-// a [RuleSet] before any outbound connection is established.
-type Request struct {
-	// Command is the SOCKS5 command ([CommandConnect] or [CommandUDPAssociate]).
-	Command Command
-	// ClientAddr is the client's TCP source address (IP already Unmap'd).
-	ClientAddr netip.AddrPort
-	// Dest is the parsed destination. Domain destinations are not yet resolved
-	// at the time Allow is called.
-	Dest AddrSpec
-	// Auth carries identity from the completed auth phase. Type-assert to
-	// [NoAuthInfo] or [UserPassInfo] to inspect method-specific fields.
-	Auth AuthInfo
-}
-
-// RuleSet gates incoming SOCKS5 requests before any outbound connection is
-// attempted. Returning false sends reply 0x02 (not allowed) and closes the
-// connection cleanly.
-//
-// Allow receives a copy of Request; modifications have no effect.
-// The context is derived from context.Background().
-type RuleSet interface {
-	Allow(ctx context.Context, req Request) bool
-}
-
-// PermitAll is a [RuleSet] that allows every request unconditionally.
-// It is the default when [Config.Rules] is nil.
-type PermitAll struct{}
-
-func (PermitAll) Allow(_ context.Context, _ Request) bool { return true }
-
-// PermitCommand is a [RuleSet] that selectively enables SOCKS5 commands.
-// Commands not explicitly enabled are rejected with reply 0x02 (not allowed).
-//
-//	Rules: socks5.PermitCommand{EnableConnect: true} // TCP only; UDP rejected
-type PermitCommand struct {
-	// EnableConnect permits CONNECT (TCP tunnel) requests.
-	EnableConnect bool
-	// EnableUDPAssociate permits UDP ASSOCIATE requests.
-	EnableUDPAssociate bool
-}
-
-func (p PermitCommand) Allow(_ context.Context, req Request) bool {
-	switch req.Command {
-	case CommandConnect:
-		return p.EnableConnect
-	case CommandUDPAssociate:
-		return p.EnableUDPAssociate
-	default:
-		return false
-	}
-}

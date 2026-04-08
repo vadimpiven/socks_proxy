@@ -3,16 +3,9 @@
 package socks5
 
 import (
-	"context"
 	"net/netip"
 	"testing"
 )
-
-// ruleSetFunc adapts a function to the [RuleSet] interface.
-// Used by server_test.go to capture [Request] values inside integration tests.
-type ruleSetFunc func(context.Context, Request) bool
-
-func (f ruleSetFunc) Allow(ctx context.Context, req Request) bool { return f(ctx, req) }
 
 // TestAddrSpec_String verifies String() for all three address families (IPv4,
 // IPv6, domain). The output must be a valid "host:port" argument for net.Dial.
@@ -54,49 +47,59 @@ func TestAddrSpec_AddrPort(t *testing.T) {
 	}
 }
 
-// TestPermitAll verifies that [PermitAll] allows every request unconditionally,
-// regardless of command or authentication method.
-func TestPermitAll(t *testing.T) {
-	r := PermitAll{}
-	ctx := context.Background()
-	cmds := []Command{CommandConnect, CommandUDPAssociate, CommandBind, Command(0xFF)}
-	for _, cmd := range cmds {
-		req := Request{
-			Command:    cmd,
-			ClientAddr: netip.MustParseAddrPort("127.0.0.1:1234"),
-			Auth:       NoAuthInfo{},
-		}
-		if !r.Allow(ctx, req) {
-			t.Errorf("PermitAll.Allow(%#x) = false, want true", byte(cmd))
+// ---------------------------------------------------------------------------
+// isPrivateAddr — unit tests for the private-destination guard
+// ---------------------------------------------------------------------------
+
+// TestIsPrivateAddr_BlockedRanges verifies that loopback, RFC 1918, link-local,
+// and unspecified addresses are classified as private.
+func TestIsPrivateAddr_BlockedRanges(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1",       // IPv4 loopback
+		"127.0.0.255",     // IPv4 loopback subnet
+		"10.0.0.1",        // RFC 1918
+		"172.16.0.1",      // RFC 1918
+		"192.168.1.1",     // RFC 1918
+		"169.254.169.254", // link-local (AWS metadata service)
+		"169.254.0.1",     // link-local
+		"0.0.0.0",         // unspecified
+		"::1",             // IPv6 loopback
+		"fc00::1",         // IPv6 ULA
+		"fd12:3456::1",    // IPv6 ULA (fd00::/8 ⊂ fc00::/7)
+		"fe80::1",         // IPv6 link-local
+		"::",              // IPv6 unspecified
+	}
+	for _, raw := range blocked {
+		addr := netip.MustParseAddr(raw)
+		if !isPrivateAddr(addr) {
+			t.Errorf("isPrivateAddr(%s) = false, want true", raw)
 		}
 	}
 }
 
-// TestPermitCommand verifies that [PermitCommand] allows and denies the
-// correct command types according to its configuration.
-func TestPermitCommand(t *testing.T) {
-	r := PermitCommand{EnableConnect: true, EnableUDPAssociate: false}
-	ctx := context.Background()
-	base := Request{
-		ClientAddr: netip.MustParseAddrPort("127.0.0.1:1234"),
-		Auth:       NoAuthInfo{},
+// TestIsPrivateAddr_AllowedRanges verifies that public IP addresses are not
+// classified as private.
+func TestIsPrivateAddr_AllowedRanges(t *testing.T) {
+	public := []string{
+		"1.1.1.1",
+		"8.8.8.8",
+		"203.0.113.1",
+		"2606:4700:4700::1111",
+		"2001:db8::1",
 	}
-
-	cases := []struct {
-		cmd  Command
-		want bool
-		name string
-	}{
-		{CommandConnect, true, "CONNECT"},
-		{CommandUDPAssociate, false, "UDP ASSOCIATE"},
-		{CommandBind, false, "BIND"},
-		{Command(0xFF), false, "unknown command"},
-	}
-	for _, tc := range cases {
-		req := base
-		req.Command = tc.cmd
-		if got := r.Allow(ctx, req); got != tc.want {
-			t.Errorf("PermitCommand.Allow(%s) = %v, want %v", tc.name, got, tc.want)
+	for _, raw := range public {
+		addr := netip.MustParseAddr(raw)
+		if isPrivateAddr(addr) {
+			t.Errorf("isPrivateAddr(%s) = true, want false", raw)
 		}
+	}
+}
+
+// TestIsPrivateAddr_IPv4MappedIPv6 verifies that an IPv4-mapped IPv6 address
+// (::ffff:10.0.0.1) is normalised via Unmap() before the private check.
+func TestIsPrivateAddr_IPv4MappedIPv6(t *testing.T) {
+	mapped := netip.MustParseAddr("::ffff:10.0.0.1")
+	if !isPrivateAddr(mapped) {
+		t.Errorf("isPrivateAddr(::ffff:10.0.0.1) = false, want true (RFC 1918 after Unmap)")
 	}
 }

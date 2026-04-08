@@ -200,17 +200,47 @@ func writeReply(w io.Writer, code byte, bound AddrSpec) error {
 
 // appendUDPResponse writes a SOCKS5 UDP response header (RFC 1928 §7) followed
 // by payload into dst and returns the number of bytes written. dst must have
-// capacity of at least 22 + len(payload). Used by the relay loop to avoid a
+// length of at least 22 + len(payload). Used by the relay loop to avoid a
 // per-packet heap allocation.
 //
 // Header layout: RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT(2) | DATA
+//
+// Note: the previous implementation used append(dst[:3], ...) relying on
+// append staying in the same backing array when cap is large enough. That
+// trick is valid but brittle — any change to dst's capacity breaks it
+// silently. Direct index writes are explicit and capacity-independent.
 func appendUDPResponse(dst []byte, from netip.AddrPort, payload []byte) int {
 	dst[0], dst[1], dst[2] = 0, 0, 0 // RSV RSV FRAG
-	src := AddrSpec{IP: from.Addr().Unmap()}
-	hdr := appendAddr(dst[:3], src)
+	n := 3
+
+	addr := from.Addr().Unmap()
+	switch {
+	case addr.Is4():
+		a := addr.As4()
+		dst[n] = addrTypeIPv4
+		n++
+		copy(dst[n:], a[:])
+		n += 4
+	case addr.Is6():
+		a := addr.As16()
+		dst[n] = addrTypeIPv6
+		n++
+		copy(dst[n:], a[:])
+		n += 16
+	default:
+		// Zero or invalid address: encode as IPv4 0.0.0.0, matching the
+		// appendAddr default case and RFC 1928 §6 error-reply convention.
+		dst[n] = addrTypeIPv4
+		n++
+		dst[n], dst[n+1], dst[n+2], dst[n+3] = 0, 0, 0, 0
+		n += 4
+	}
+
 	port := from.Port()
-	hdr = append(hdr, byte(port>>8), byte(port))
-	n := len(hdr)
+	dst[n] = byte(port >> 8)
+	dst[n+1] = byte(port)
+	n += 2
+
 	copy(dst[n:], payload)
 	return n + len(payload)
 }

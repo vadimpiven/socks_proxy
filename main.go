@@ -5,6 +5,10 @@
 // It supports TCP CONNECT and UDP ASSOCIATE through IPv4 and IPv6 networks,
 // with optional username/password authentication per RFC 1928 and RFC 1929.
 //
+// By default private, loopback, and link-local destinations are blocked
+// (see [socks5.DenyPrivateDestinations]). Use -private for deployments that
+// intentionally proxy to internal infrastructure.
+//
 // Usage:
 //
 //	socks5-srv [flags]
@@ -13,7 +17,7 @@
 //	  -pass      secret        password (must pair with -user)
 //	  -bind      203.0.113.1   bind outgoing connections to this IP
 //	  -allow     127.0.0.1,::1 IPs that bypass auth (comma-separated)
-//	  -auth-once               whitelist a client IP after first successful auth
+//	  -private                 allow connections to private/loopback destinations
 //	  -quiet                   suppress informational log output
 package main
 
@@ -37,7 +41,7 @@ func main() {
 	pass := flag.String("pass", "", "password for client authentication")
 	bind := flag.String("bind", "", "local IP for outbound connections")
 	allow := flag.String("allow", "", "comma-separated IPs allowed without authentication")
-	authOnce := flag.Bool("auth-once", false, "whitelist a client IP after its first successful auth")
+	private := flag.Bool("private", false, "allow connections to private/loopback IP destinations")
 	quiet := flag.Bool("quiet", false, "suppress informational log output")
 	flag.Parse()
 
@@ -45,8 +49,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: -user and -pass must be provided together")
 		os.Exit(1)
 	}
-	if (*authOnce || *allow != "") && *user == "" {
-		fmt.Fprintln(os.Stderr, "error: -auth-once and -allow require -user/-pass")
+	if *allow != "" && *user == "" {
+		fmt.Fprintln(os.Stderr, "error: -allow requires -user/-pass")
 		os.Exit(1)
 	}
 
@@ -56,9 +60,9 @@ func main() {
 	}
 
 	cfg := socks5.Config{
-		Logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})),
-		BindAddr: *bind,
-		AuthOnce: *authOnce,
+		Logger:                   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})),
+		BindAddr:                 *bind,
+		AllowPrivateDestinations: *private,
 	}
 
 	if *user != "" {

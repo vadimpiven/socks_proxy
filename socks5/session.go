@@ -53,16 +53,26 @@ func newSession(conn net.Conn, srv *Server) *session {
 	}
 }
 
+// isPrivateAddr reports whether addr falls into a non-routable address range
+// that should not be reachable via a public SOCKS5 proxy.
+func isPrivateAddr(addr netip.Addr) bool {
+	ip := addr.Unmap()
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+}
+
 // handle drives the full SOCKS5 session pipeline to completion.
-func (s *session) handle() {
+// ctx is the server's shutdown context; it is passed into dials and the UDP
+// association so they are cancelled promptly when the server stops.
+func (s *session) handle(ctx context.Context) {
 	defer s.conn.Close()
 
 	// A single deadline covers the entire handshake (greeting + auth +
 	// request) to prevent slow-loris resource exhaustion.
-	s.conn.SetDeadline(time.Now().Add(s.srv.timeouts.handshake))
+	// SetDeadline can only fail if the connection is already closed, in which
+	// case the next I/O call will surface the error. Safe to ignore here.
+	_ = s.conn.SetDeadline(time.Now().Add(s.srv.timeouts.handshake))
 
-	authInfo, err := s.negotiateAuth()
-	if err != nil {
+	if err := s.negotiateAuth(); err != nil {
 		s.log.Info("auth failed", "err", err)
 		gracefulClose(s.conn)
 		return
@@ -75,30 +85,29 @@ func (s *session) handle() {
 		return
 	}
 
-	// Present the request to the rule set before doing anything observable
-	// externally (e.g. a DNS lookup or TCP connection).
-	req := Request{
-		Command:    cmd,
-		ClientAddr: s.ap,
-		Dest:       dest,
-		Auth:       authInfo,
-	}
-	if !s.srv.rules.Allow(context.Background(), req) {
-		_ = writeReply(s.conn, replyNotAllowed, AddrSpec{})
-		s.log.Info("request denied by rule set",
-			"cmd", fmt.Sprintf("%#x", byte(cmd)), "target", dest)
-		gracefulClose(s.conn)
-		return
+	// Block CONNECT to private/loopback/link-local destinations unless the
+	// operator explicitly permits it. The check applies only to CONNECT:
+	// UDP ASSOCIATE's DST.ADDR is a client source-address hint (RFC 1928 §7),
+	// not a forwarding target. Domain destinations are passed through because
+	// DNS has not yet resolved at this point.
+	if cmd == CommandConnect && !s.srv.cfg.AllowPrivateDestinations {
+		if dest.IP.IsValid() && isPrivateAddr(dest.IP) {
+			_ = writeReply(s.conn, replyNotAllowed, AddrSpec{})
+			s.log.Info("request denied: private destination", "target", dest)
+			gracefulClose(s.conn)
+			return
+		}
 	}
 
 	// Clear the handshake deadline before entering the data phase.
-	s.conn.SetDeadline(time.Time{})
+	// Same rationale as above: safe to ignore.
+	_ = s.conn.SetDeadline(time.Time{})
 
 	switch cmd {
 	case CommandConnect:
-		s.handleConnect(dest)
+		s.handleConnect(ctx, dest)
 	case CommandUDPAssociate:
-		s.handleUDPAssociate()
+		s.handleUDPAssociate(ctx)
 	default:
 		_ = writeReply(s.conn, replyCmdNotSupported, AddrSpec{})
 		s.log.Info("command not supported", "cmd", fmt.Sprintf("%#x", byte(cmd)))
@@ -109,33 +118,29 @@ func (s *session) handle() {
 // negotiateAuth performs RFC 1928 §3 method negotiation followed by the
 // sub-negotiation of the selected method.
 //
-// Trusted-IP bypass: a client whose source IP is in the trusted set is offered
-// NoAuth even when all configured authenticators require credentials, without
-// allocating a temporary authenticator slice.
-//
-// Auth-once promotion: after the first successful sub-negotiation for a
-// non-NoAuth method, the client's IP is added to the trusted set when
-// cfg.AuthOnce is true.
+// Trusted-IP bypass: a client whose source IP is in the static trusted set is
+// offered NoAuth even when all configured authenticators require credentials,
+// without allocating a temporary authenticator slice.
 //
 // Wire format — greeting:  VER(1) | NMETHODS(1) | METHODS(1-255)
 // Wire format — selection: VER(1) | METHOD(1)
-func (s *session) negotiateAuth() (AuthInfo, error) {
+func (s *session) negotiateAuth() error {
 	var hdr [2]byte
 	if _, err := io.ReadFull(s.conn, hdr[:]); err != nil {
-		return nil, fmt.Errorf("read greeting: %w", err)
+		return fmt.Errorf("read greeting: %w", err)
 	}
 	if hdr[0] != version5 {
-		return nil, fmt.Errorf("unsupported SOCKS version: %#x", hdr[0])
+		return fmt.Errorf("unsupported SOCKS version: %#x", hdr[0])
 	}
 	if hdr[1] == 0 {
 		// RFC 1928 §3: NMETHODS must be 1-255.
 		_, _ = s.conn.Write([]byte{version5, methodNoAcceptable})
-		return nil, errors.New("NMETHODS is 0: client offered no methods (RFC 1928 §3)")
+		return errors.New("NMETHODS is 0: client offered no methods (RFC 1928 §3)")
 	}
 
 	methods := make([]byte, hdr[1])
 	if _, err := io.ReadFull(s.conn, methods); err != nil {
-		return nil, fmt.Errorf("read methods: %w", err)
+		return fmt.Errorf("read methods: %w", err)
 	}
 
 	// Trusted clients bypass credential-requiring authenticators: offer
@@ -155,25 +160,21 @@ func (s *session) negotiateAuth() (AuthInfo, error) {
 
 	if selected == nil {
 		_, _ = s.conn.Write([]byte{version5, methodNoAcceptable})
-		return nil, errors.New("no acceptable authentication method")
+		return errors.New("no acceptable authentication method")
 	}
 
 	if _, err := s.conn.Write([]byte{version5, selected.Code()}); err != nil {
-		return nil, fmt.Errorf("write method selection: %w", err)
+		return fmt.Errorf("write method selection: %w", err)
 	}
 
-	info, err := selected.Authenticate(s.conn)
+	identity, err := selected.Authenticate(s.conn)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	// Auth-once: promote this IP for future connections.
-	if s.srv.cfg.AuthOnce && selected.Code() != methodNoAuth {
-		s.srv.addTrusted(s.ap.Addr())
-		s.log.Info("IP promoted to trusted list (auth-once)")
+	if identity != "" {
+		s.log.Info("authenticated", "user", identity)
 	}
-
-	return info, nil
+	return nil
 }
 
 // readRequest reads VER | CMD | RSV | ATYP | DST.ADDR | DST.PORT and returns
@@ -207,8 +208,8 @@ func (s *session) readRequest() (Command, AddrSpec, error) {
 
 // handleConnect dials the destination, sends the success reply, and relays
 // data until both sides close.
-func (s *session) handleConnect(dest AddrSpec) {
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), s.srv.timeouts.dial)
+func (s *session) handleConnect(ctx context.Context, dest AddrSpec) {
+	dialCtx, dialCancel := context.WithTimeout(ctx, s.srv.timeouts.dial)
 	defer dialCancel()
 
 	remote, err := s.srv.dial(dialCtx, "tcp", dest.String())

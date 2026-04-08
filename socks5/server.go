@@ -34,18 +34,25 @@
 //   - UDP ASSOCIATE (0x03): datagram relay with SOCKS5 encapsulation;
 //     fragmentation is not supported (RFC 1928 §7 permits dropping it)
 //   - No-auth (0x00) and username/password (0x02) authentication (RFC 1929)
-//   - Trusted-IP bypass ([Config.TrustedIPs]) and auth-once promotion ([Config.AuthOnce])
+//   - Trusted-IP bypass ([Config.TrustedIPs])
 //
 // BIND (0x02) is rejected with reply 0x07 (command not supported).
 // GSSAPI (method 0x01) is not implemented; clients that offer only GSSAPI
 // receive reply 0xFF (no acceptable method). RFC 1928 §3 marks GSSAPI as
 // MUST, but it is absent from virtually all deployed SOCKS5 implementations.
 //
+// # Access control
+//
+// The single [Config.AllowPrivateDestinations] flag governs whether CONNECT
+// requests to private, loopback, and link-local addresses are permitted.
+// When false (default), such connections receive reply 0x02 (not allowed),
+// protecting against SSRF attacks in internet-facing deployments.
+// Set true only when the proxy intentionally serves internal infrastructure.
+//
 // # Extension points
 //
 // Every component is replaceable through interfaces:
 //   - [Authenticator] / [CredentialStore] — custom authentication logic
-//   - [RuleSet] — per-request access control
 //   - [Resolver] — custom DNS resolution for the UDP relay path
 //   - [DialFunc] — custom outbound TCP (proxy chaining, metrics, TLS, etc.)
 package socks5
@@ -77,9 +84,13 @@ const (
 	defaultMaxConns = 1024
 )
 
-// Config holds all settings for a SOCKS5 server. All fields have sensible
-// defaults — a zero-value Config starts an open proxy that accepts every
-// connection. All fields are read-only after being passed to [NewServer].
+// Config holds all settings for a SOCKS5 server. All fields are read-only
+// after being passed to [NewServer].
+//
+// A zero-value Config starts a proxy that requires no authentication and
+// blocks CONNECT to private, loopback, and link-local IP destinations
+// ([AllowPrivateDestinations] defaults to false). Set [AllowPrivateDestinations]
+// to true for deployments that intentionally proxy to internal infrastructure.
 type Config struct {
 	// Logger receives all server-level and session-level log output.
 	// Defaults to [slog.Default] when nil.
@@ -95,10 +106,19 @@ type Config struct {
 	// Leave nil (or empty) to accept unauthenticated connections.
 	Authenticators []Authenticator
 
-	// Rules gates each request before any outbound connection is made.
-	// Defaults to [PermitAll] when nil. Use [PermitCommand] to restrict which
-	// SOCKS5 commands clients may issue.
-	Rules RuleSet
+	// AllowPrivateDestinations permits CONNECT requests to private, loopback,
+	// and link-local IP addresses (RFC 1918, 127.0.0.0/8, 169.254.0.0/16,
+	// fc00::/7, fe80::/10, etc.).
+	//
+	// When false (default), such connections are rejected with reply 0x02
+	// (not allowed), protecting internet-facing proxies against SSRF attacks.
+	// Set true only when the proxy intentionally serves internal infrastructure
+	// where private destinations are valid targets.
+	//
+	// Note: DOMAINNAME destinations (ATYP 0x03) are not filtered by this flag
+	// because DNS resolution has not yet occurred at request time. Use a
+	// validating [DialFunc] to protect against DNS-based SSRF.
+	AllowPrivateDestinations bool
 
 	// Resolver resolves domain names for the UDP ASSOCIATE relay path.
 	// TCP CONNECT lets [Dial] handle DNS internally.
@@ -119,14 +139,10 @@ type Config struct {
 	BindAddr string
 
 	// TrustedIPs lists client source addresses that bypass authentication even
-	// when Authenticators require credentials. IPv4 and IPv4-mapped IPv6 forms
-	// are normalised before comparison.
+	// when Authenticators require credentials. This is a static allowlist
+	// evaluated at request time; it cannot be modified after [NewServer] returns.
+	// IPv4 and IPv4-mapped IPv6 forms are normalised before comparison.
 	TrustedIPs []netip.Addr
-
-	// AuthOnce, when true, adds a client IP to TrustedIPs after its first
-	// successful authentication. Subsequent connections from that IP skip auth.
-	// Has no effect when all Authenticators accept unauthenticated clients.
-	AuthOnce bool
 
 	// MaxConns limits concurrent client connections. Zero means 1024.
 	MaxConns int
@@ -162,12 +178,11 @@ type Server struct {
 	// Resolved interface values — always non-nil after NewServer.
 	dial     DialFunc
 	resolver Resolver
-	rules    RuleSet
 
-	// Runtime trusted-IP set. Starts as a copy of cfg.TrustedIPs and grows
-	// when AuthOnce is enabled. Keyed on Unmap()-normalised addresses.
-	trustedMu  sync.RWMutex
-	trustedIPs map[netip.Addr]bool
+	// trustedIPs is a read-only set built from cfg.TrustedIPs in NewServer.
+	// Because it is never written after construction, concurrent reads from
+	// session goroutines are safe without a mutex.
+	trustedIPs map[netip.Addr]struct{}
 }
 
 // serverTimeouts holds resolved (non-zero) timeout values for use at runtime.
@@ -197,9 +212,6 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if len(cfg.Authenticators) == 0 {
 		cfg.Authenticators = []Authenticator{NoAuthAuthenticator{}}
-	}
-	if cfg.Rules == nil {
-		cfg.Rules = PermitAll{}
 	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = DefaultResolver{}
@@ -243,11 +255,14 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	// Build the outbound dialer when the caller has not provided one.
+	// The dial timeout is enforced via the per-call context in handleConnect;
+	// net.Dialer.Timeout is not set here to avoid a redundant, confusing second
+	// limit that would shadow the context deadline.
 	var dial DialFunc
 	if cfg.Dial != nil {
 		dial = cfg.Dial
 	} else {
-		d := &net.Dialer{Timeout: to.dial}
+		d := &net.Dialer{}
 		if cfg.BindAddr != "" {
 			parsed, err := netip.ParseAddr(cfg.BindAddr)
 			if err != nil {
@@ -258,10 +273,10 @@ func NewServer(cfg Config) (*Server, error) {
 		dial = d.DialContext
 	}
 
-	// Seed the runtime trusted set. netip.Addr is a value type — no copies needed.
-	trusted := make(map[netip.Addr]bool, len(cfg.TrustedIPs))
+	// Build the read-only trusted-IP set from the static config.
+	trusted := make(map[netip.Addr]struct{}, len(cfg.TrustedIPs))
 	for _, ip := range cfg.TrustedIPs {
-		trusted[ip.Unmap()] = true
+		trusted[ip.Unmap()] = struct{}{}
 	}
 
 	return &Server{
@@ -270,7 +285,6 @@ func NewServer(cfg Config) (*Server, error) {
 		timeouts:   to,
 		dial:       dial,
 		resolver:   cfg.Resolver,
-		rules:      cfg.Rules,
 		trustedIPs: trusted,
 	}, nil
 }
@@ -295,7 +309,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		ln.Close()
 	}()
 
-	var wg sync.WaitGroup
+	var (
+		wg        sync.WaitGroup
+		tempDelay time.Duration // backoff for transient accept errors
+	)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -304,16 +321,33 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 				wg.Wait()
 				return nil
 			default:
-				// net.ErrClosed means the listener itself was closed by
-				// external code (not via ctx); treat it as a permanent stop.
-				if errors.Is(err, net.ErrClosed) {
-					wg.Wait()
-					return err
-				}
-				s.cfg.Logger.Warn("accept failed", "err", err)
-				continue
 			}
+			// net.ErrClosed means the listener itself was closed by
+			// external code (not via ctx); treat it as a permanent stop.
+			if errors.Is(err, net.ErrClosed) {
+				wg.Wait()
+				return err
+			}
+			// Transient error (e.g. EMFILE – too many open files): back off
+			// exponentially to avoid a hot CPU spin. Pattern mirrors net/http.
+			if tempDelay == 0 {
+				tempDelay = 5 * time.Millisecond
+			} else {
+				tempDelay *= 2
+				if tempDelay > time.Second {
+					tempDelay = time.Second
+				}
+			}
+			s.cfg.Logger.Warn("accept failed; retrying", "err", err, "delay", tempDelay)
+			select {
+			case <-time.After(tempDelay):
+			case <-ctx.Done():
+				wg.Wait()
+				return nil
+			}
+			continue
 		}
+		tempDelay = 0
 
 		select {
 		case s.sem <- struct{}{}:
@@ -333,31 +367,17 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		go func() {
 			defer wg.Done()
 			defer func() { <-s.sem }()
-			newSession(conn, s).handle()
+			newSession(conn, s).handle(ctx)
 		}()
 	}
 }
 
-// isTrusted reports whether ip is in the runtime trusted set.
+// isTrusted reports whether ip is in the static trusted-IP set.
+// The set is read-only after NewServer, so no locking is needed.
 func (s *Server) isTrusted(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
 	}
-	s.trustedMu.RLock()
-	defer s.trustedMu.RUnlock()
-	return s.trustedIPs[ip.Unmap()]
-}
-
-// addTrusted inserts ip into the runtime trusted set (idempotent).
-func (s *Server) addTrusted(ip netip.Addr) {
-	if !ip.IsValid() {
-		return
-	}
-	ip = ip.Unmap()
-	s.trustedMu.Lock()
-	defer s.trustedMu.Unlock()
-	if s.trustedIPs == nil {
-		s.trustedIPs = make(map[netip.Addr]bool)
-	}
-	s.trustedIPs[ip] = true
+	_, ok := s.trustedIPs[ip.Unmap()]
+	return ok
 }

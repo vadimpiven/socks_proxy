@@ -21,11 +21,11 @@ func discardLogger() *slog.Logger {
 }
 
 // startEchoServer starts a TCP server that echoes all received data.
-func startEchoServer(t *testing.T) net.Listener {
-	t.Helper()
+func startEchoServer(tb testing.TB) net.Listener {
+	tb.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	go func() {
 		for {
@@ -44,8 +44,8 @@ func startEchoServer(t *testing.T) net.Listener {
 
 // startProxy starts a SOCKS5 server with the given Config on a random port.
 // If cfg.Logger is nil it is set to a discard logger so tests stay silent.
-func startProxy(t *testing.T, cfg Config) (addr string, cancel context.CancelFunc) {
-	t.Helper()
+func startProxy(tb testing.TB, cfg Config) (addr string, cancel context.CancelFunc) {
+	tb.Helper()
 	if cfg.Logger == nil {
 		cfg.Logger = discardLogger()
 	}
@@ -54,13 +54,13 @@ func startProxy(t *testing.T, cfg Config) (addr string, cancel context.CancelFun
 	srv, err := NewServer(cfg)
 	if err != nil {
 		cancel()
-		t.Fatalf("NewServer: %v", err)
+		tb.Fatalf("NewServer: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		cancel()
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	addr = ln.Addr().String()
 	go srv.Serve(ctx, ln)
@@ -70,24 +70,24 @@ func startProxy(t *testing.T, cfg Config) (addr string, cancel context.CancelFun
 // dialThroughProxy connects to target via the SOCKS5 proxy at proxyAddr using
 // golang.org/x/net/proxy — a real, independent SOCKS5 client implementation.
 // Passing a non-nil auth enables username/password authentication.
-func dialThroughProxy(t *testing.T, proxyAddr string, auth *proxy.Auth, target string) net.Conn {
-	t.Helper()
+func dialThroughProxy(tb testing.TB, proxyAddr string, auth *proxy.Auth, target string) net.Conn {
+	tb.Helper()
 	d, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	conn, err := d.Dial("tcp", target)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Cleanup(func() { conn.Close() })
+	tb.Cleanup(func() { conn.Close() })
 	return conn
 }
 
 func TestFullSession_NoAuth_Connect(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: true})
 	defer cancel()
 
 	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
@@ -108,7 +108,8 @@ func TestFullSession_UserPass_Connect(t *testing.T) {
 	defer echo.Close()
 
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
+		Authenticators:           []Authenticator{UserPassAuth("user", "pass")},
+		AllowPrivateDestinations: true,
 	})
 	defer cancel()
 
@@ -172,7 +173,10 @@ func TestFullSession_AuthFailure(t *testing.T) {
 // TestFullSession_UnsupportedCommand verifies the exact reply code (0x07) for
 // BIND, which is not implemented.
 func TestFullSession_UnsupportedCommand(t *testing.T) {
-	proxyAddr, cancel := startProxy(t, Config{})
+	// AllowPrivateDestinations: BIND targets 127.0.0.1, so private-IP filtering
+	// must be disabled to let the request reach the command-dispatch switch,
+	// which replies 0x07 (command not supported).
+	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: true})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -200,7 +204,7 @@ func TestFullSession_UnsupportedCommand(t *testing.T) {
 // TestFullSession_ConnectionRefused verifies the exact reply code (0x05) when
 // the target port is not listening.
 func TestFullSession_ConnectionRefused(t *testing.T) {
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: true})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -226,7 +230,7 @@ func TestFullSession_ConnectionRefused(t *testing.T) {
 func TestGracefulShutdown(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: true})
 
 	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
 
@@ -269,7 +273,7 @@ func TestGreeting_WrongVersion(t *testing.T) {
 }
 
 // TestGreeting_ZeroNMethods verifies RFC 1928 §3: NMETHODS=0 must be rejected
-// with method byte 0xFF.
+// with method byte 0xFF, followed by a server-initiated connection close.
 func TestGreeting_ZeroNMethods(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -288,6 +292,12 @@ func TestGreeting_ZeroNMethods(t *testing.T) {
 	}
 	if resp[1] != methodNoAcceptable {
 		t.Fatalf("METHOD = %#x, want 0xFF (no acceptable) for NMETHODS=0", resp[1])
+	}
+	// RFC 1928 §3: after X'FF' the client MUST close; the server also closes
+	// (it returned an error from negotiateAuth and calls gracefulClose).
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected server to close connection after sending X'FF'")
 	}
 }
 
@@ -352,7 +362,8 @@ func TestRequest_UnknownATYP(t *testing.T) {
 func TestConnect_DomainName(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{})
+	// AllowPrivateDestinations: "localhost" resolves to 127.0.0.1 (loopback).
+	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: true})
 	defer cancel()
 
 	_, portStr, _ := net.SplitHostPort(echo.Addr().String())
@@ -371,6 +382,7 @@ func TestConnect_DomainName(t *testing.T) {
 
 // TestRequest_WrongVersion verifies that a wrong VER byte in the request phase
 // (after successful auth) causes the server to close without sending a reply.
+// The VER check runs inside readRequest() before rules are consulted.
 func TestRequest_WrongVersion(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -397,7 +409,7 @@ func TestRequest_WrongVersion(t *testing.T) {
 func TestConnect_BNDAddrPort(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: true})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -446,27 +458,39 @@ func TestConnect_BNDAddrPort(t *testing.T) {
 	}
 }
 
-// TestRuleSet_DenyAll verifies the exact reply code (0x02) when the RuleSet
-// denies a request.
-func TestRuleSet_DenyAll(t *testing.T) {
-	proxyAddr, cancel := startProxy(t, Config{Rules: PermitCommand{}})
-	defer cancel()
-
+// TestDefaultConfig_BlocksPrivateConnect verifies that the default Config
+// (AllowPrivateDestinations=false) rejects CONNECT to loopback/private IPs
+// with reply 0x02 (not allowed), protecting against SSRF.
+// connectAndExpectBlocked dials the proxy, completes the NoAuth greeting, sends
+// a CONNECT to the given raw address bytes (ATYP + addr + port), and asserts
+// that the proxy returns reply 0x02 (not allowed) followed by a connection close.
+func connectAndExpectBlocked(t *testing.T, proxyAddr string, atyp byte, addrBytes []byte, port uint16) {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	conn.Write([]byte{version5, 0x01, methodNoAuth})
 	io.ReadFull(conn, make([]byte, 2))
 
-	conn.Write([]byte{version5, byte(CommandConnect), 0x00, addrTypeIPv4, 127, 0, 0, 1, 0x00, 0x50})
+	req := append([]byte{version5, byte(CommandConnect), 0x00, atyp}, addrBytes...)
+	req = binary.BigEndian.AppendUint16(req, port)
+	conn.Write(req)
 
+	// Failure replies always use a zero AddrSpec, which encodes as ATYP=IPv4
+	// 0.0.0.0:0: VER(1)+REP(1)+RSV(1)+ATYP(1)+addr(4)+port(2) = 10 bytes.
+	// Reading the full reply before checking for close is required; reading
+	// fewer bytes would leave BND.ADDR/PORT in the TCP buffer, causing the
+	// subsequent Read to return those bytes rather than EOF.
 	reply := make([]byte, 10)
-	io.ReadFull(conn, reply)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read failure reply: %v", err)
+	}
 	if reply[1] != replyNotAllowed {
-		t.Fatalf("REP = %#x, want %#x (not allowed)", reply[1], replyNotAllowed)
+		t.Fatalf("REP = %#x, want 0x02 (not allowed)", reply[1])
 	}
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
@@ -474,36 +498,51 @@ func TestRuleSet_DenyAll(t *testing.T) {
 	}
 }
 
-// TestRuleSet_AuthInfoAvailable verifies that [Request.Auth] carries the
-// identity from the completed auth phase into the rule set.
-func TestRuleSet_AuthInfoAvailable(t *testing.T) {
-	echo := startEchoServer(t)
-	defer echo.Close()
-
-	var gotAuth AuthInfo
-	rules := ruleSetFunc(func(_ context.Context, req Request) bool {
-		gotAuth = req.Auth
-		return true
-	})
-
-	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
-		Rules:          rules,
-	})
+// TestDefaultConfig_BlocksPrivateConnect verifies that the default config
+// (AllowPrivateDestinations=false) blocks CONNECT to several categories of
+// private/reserved addresses across both IPv4 and IPv6.
+func TestDefaultConfig_BlocksPrivateConnect(t *testing.T) {
+	proxyAddr, cancel := startProxy(t, Config{}) // default: deny private
 	defer cancel()
 
-	conn := dialThroughProxy(t, proxyAddr,
-		&proxy.Auth{User: "user", Password: "pass"},
-		echo.Addr().String())
-	conn.Close()
-	time.Sleep(50 * time.Millisecond)
-
-	info, ok := gotAuth.(UserPassInfo)
-	if !ok {
-		t.Fatalf("Auth is %T, want UserPassInfo", gotAuth)
+	cases := []struct {
+		name  string
+		atyp  byte
+		addr  []byte
+	}{
+		{"IPv4 loopback", addrTypeIPv4, []byte{127, 0, 0, 1}},
+		{"IPv4 RFC1918 10.x", addrTypeIPv4, []byte{10, 0, 0, 1}},
+		{"IPv4 RFC1918 192.168.x", addrTypeIPv4, []byte{192, 168, 1, 1}},
+		{"IPv4 link-local", addrTypeIPv4, []byte{169, 254, 169, 254}},
+		// IPv6 addresses (16 bytes)
+		{"IPv6 loopback ::1", addrTypeIPv6, func() []byte { a := make([]byte, 16); a[15] = 1; return a }()},
+		{"IPv6 ULA fc00::1", addrTypeIPv6, func() []byte { a := make([]byte, 16); a[0] = 0xfc; a[15] = 1; return a }()},
+		{"IPv6 link-local fe80::1", addrTypeIPv6, func() []byte { a := make([]byte, 16); a[0] = 0xfe; a[1] = 0x80; a[15] = 1; return a }()},
 	}
-	if info.Username != "user" {
-		t.Fatalf("Username = %q, want %q", info.Username, "user")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			connectAndExpectBlocked(t, proxyAddr, tc.atyp, tc.addr, 80)
+		})
+	}
+}
+
+// TestAllowPrivateDestinations_PermitsLoopback verifies that setting
+// AllowPrivateDestinations=true allows CONNECT to loopback addresses.
+func TestAllowPrivateDestinations_PermitsLoopback(t *testing.T) {
+	echo := startEchoServer(t)
+	defer echo.Close()
+	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: true})
+	defer cancel()
+
+	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
+	conn.Write([]byte("private-ok"))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "private-ok" {
+		t.Fatalf("got %q, want %q", buf[:n], "private-ok")
 	}
 }
 
@@ -514,8 +553,9 @@ func TestTrustedIPs_BypassAuth(t *testing.T) {
 	defer echo.Close()
 
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
-		TrustedIPs:     []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+		Authenticators:           []Authenticator{UserPassAuth("user", "pass")},
+		TrustedIPs:               []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+		AllowPrivateDestinations: true,
 	})
 	defer cancel()
 
@@ -530,7 +570,8 @@ func TestTrustedIPs_BypassAuth(t *testing.T) {
 }
 
 // TestTrustedIPs_UnknownIPRequiresAuth verifies that a client not in
-// TrustedIPs is rejected at method negotiation when it offers only NoAuth.
+// TrustedIPs is rejected at method negotiation when it offers only NoAuth,
+// and that the server closes the connection after sending X'FF'.
 func TestTrustedIPs_UnknownIPRequiresAuth(t *testing.T) {
 	// Trust only 10.0.0.1; the test client arrives from 127.0.0.1.
 	proxyAddr, cancel := startProxy(t, Config{
@@ -550,6 +591,11 @@ func TestTrustedIPs_UnknownIPRequiresAuth(t *testing.T) {
 	io.ReadFull(conn, resp)
 	if resp[1] != methodNoAcceptable {
 		t.Fatalf("METHOD = %#x, want 0xFF (no acceptable)", resp[1])
+	}
+	// Server must close after X'FF' (gracefulClose path).
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected server to close after X'FF'")
 	}
 }
 
@@ -622,77 +668,192 @@ func TestMaxConns_Limit(t *testing.T) {
 // a connection that authenticates via the NoAuth method (method 0x00) must
 // NOT promote the client IP to the trusted list, because no credentials were
 // verified. The guard is `selected.Code() != methodNoAuth`.
-func TestAuthOnce_NoAuthNotPromoted(t *testing.T) {
-	echo := startEchoServer(t)
-	defer echo.Close()
+// ---------------------------------------------------------------------------
+// RFC 1928 §3: method negotiation edge cases
+// ---------------------------------------------------------------------------
 
-	// Authenticators contains only UserPass. With AuthOnce enabled, a client
-	// that connects with NoAuth from a non-trusted IP must still be rejected.
-	// We verify by attempting a second connection WITHOUT credentials after a
-	// first connection that was granted NoAuth only because the IP was in
-	// TrustedIPs — not because AuthOnce promoted it.
-	//
-	// Concretely: IP 127.0.0.1 is trusted; it uses NoAuth and must NOT cause
-	// AuthOnce promotion (it's already trusted, idempotent). A subsequent
-	// connection from a truly untrusted IP still requires credentials.
-	//
-	// The meaningful path being tested: selected.Code() == methodNoAuth →
-	// addTrusted is NOT called.
-	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("u", "p")},
-		TrustedIPs:     []netip.Addr{netip.MustParseAddr("127.0.0.1")},
-		AuthOnce:       true,
-	})
+// TestGreeting_OnlyGSSAPIMethod verifies that a client advertising only
+// method 0x01 (GSSAPI) — which this server does not implement — receives X'FF'
+// (no acceptable method) and the server closes the connection.
+//
+// RFC 1928 §3 MUST: compliant servers must support GSSAPI. This implementation
+// intentionally omits GSSAPI (absent from virtually all deployed SOCKS5 stacks)
+// and documents the omission. The correct observable behaviour is still X'FF'.
+func TestGreeting_OnlyGSSAPIMethod(t *testing.T) {
+	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
 
-	// First connection: trusted IP → NoAuth path (selected.Code() == methodNoAuth).
-	conn1 := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
-	conn1.Close()
-	time.Sleep(50 * time.Millisecond)
-
-	// Verify the trusted-IP set was not spuriously modified by attempting a
-	// raw connection that offers ONLY NoAuth. Because 127.0.0.1 is in TrustedIPs
-	// (explicitly, not via AuthOnce), this succeeds — confirming the no-op path.
-	conn2 := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
-	conn2.Write([]byte("ok"))
-	buf := make([]byte, 2)
-	if _, err := io.ReadFull(conn2, buf); err != nil || string(buf) != "ok" {
-		t.Fatalf("expected echo, got err=%v buf=%q", err, buf)
-	}
-}
-
-// TestAuthOnce_SecondConnectionSkipsAuth verifies that [Config.AuthOnce]
-// promotes a client IP to the trusted list after its first authenticated
-// connection, allowing subsequent connections without credentials.
-func TestAuthOnce_SecondConnectionSkipsAuth(t *testing.T) {
-	echo := startEchoServer(t)
-	defer echo.Close()
-
-	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
-		AuthOnce:       true,
-	})
-	defer cancel()
-
-	conn1 := dialThroughProxy(t, proxyAddr,
-		&proxy.Auth{User: "user", Password: "pass"},
-		echo.Addr().String())
-	conn1.Write([]byte("first"))
-	io.ReadAll(io.LimitReader(conn1, 5))
-	conn1.Close()
-
-	time.Sleep(50 * time.Millisecond)
-
-	// IP is now trusted — no credentials required.
-	conn2 := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
-
-	conn2.Write([]byte("second"))
-	buf := make([]byte, 64)
-	n, err := conn2.Read(buf)
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(buf[:n]) != "second" {
-		t.Fatalf("got %q, want %q", buf[:n], "second")
+	defer conn.Close()
+
+	conn.Write([]byte{version5, 0x01, 0x01}) // NMETHODS=1, METHOD=GSSAPI
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	if resp[1] != methodNoAcceptable {
+		t.Fatalf("METHOD = %#x, want 0xFF (no acceptable) for GSSAPI-only client", resp[1])
+	}
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected server to close after X'FF'")
+	}
+}
+
+// TestNegotiation_ServerPriorityOverClient verifies RFC 1928 §3: the server
+// selects from the client's methods according to the SERVER'S own priority
+// order (first match in Config.Authenticators), not the client's order.
+//
+// Scenario A: server has [UserPass]; client offers [NoAuth, UserPass].
+// Server must select UserPass (its first and only authenticator), ignoring
+// that NoAuth appears first in the client's list.
+func TestNegotiation_ServerPicksOwnPriority(t *testing.T) {
+	echo := startEchoServer(t)
+	defer echo.Close()
+
+	proxyAddr, cancel := startProxy(t, Config{
+		Authenticators: []Authenticator{UserPassAuth("u", "p")},
+	})
+	defer cancel()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Client advertises NoAuth first, then UserPass.
+	conn.Write([]byte{version5, 0x02, methodNoAuth, methodUserPass})
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	// Server must pick UserPass (its only authenticator), not NoAuth.
+	if resp[1] != methodUserPass {
+		t.Fatalf("METHOD = %#x, want 0x02 (UserPass): server must use its own priority", resp[1])
+	}
+
+	// Complete UserPass sub-negotiation so the session ends cleanly.
+	conn.Write([]byte{authSubVersion, 0x01, 'u', 0x01, 'p'})
+	io.ReadFull(conn, make([]byte, 2))
+}
+
+// TestNegotiation_ServerPicksFirstAuthenticator verifies that when the server
+// has multiple authenticators configured, it picks the FIRST one the client
+// also supports.
+//
+// Scenario B: server has [NoAuth, UserPass]; client offers [UserPass, NoAuth].
+// Server must select NoAuth (its first authenticator), even though UserPass
+// appears first in the client's METHOD list.
+func TestNegotiation_ServerPicksFirstAuthenticator(t *testing.T) {
+	proxyAddr, cancel := startProxy(t, Config{
+		// Explicit NoAuth before UserPass — server priority trumps client order.
+		Authenticators: []Authenticator{NoAuthAuthenticator{}, UserPassAuth("u", "p")},
+	})
+	defer cancel()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Client advertises UserPass first, then NoAuth.
+	conn.Write([]byte{version5, 0x02, methodUserPass, methodNoAuth})
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	// Server must pick NoAuth (first in its own list).
+	if resp[1] != methodNoAuth {
+		t.Fatalf("METHOD = %#x, want 0x00 (NoAuth): server must use its own priority", resp[1])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RFC 1928 §6 / §7: reply address validation
+// ---------------------------------------------------------------------------
+
+// TestUDPAssociate_BNDAddrPort verifies RFC 1928 §6/§7: the BND.ADDR in the
+// UDP ASSOCIATE reply must be a non-unspecified address and BND.PORT must be
+// non-zero, so clients know where to send their datagrams.
+func TestUDPAssociate_BNDAddrPort(t *testing.T) {
+	// DenyPrivateDestinations (default) passes UDP ASSOCIATE unconditionally;
+	// no explicit Rules override needed.
+	proxyAddr, cancel := startProxy(t, Config{})
+	defer cancel()
+
+	ctrl, relayAddr := doUDPAssociate(t, proxyAddr)
+	defer ctrl.Close()
+
+	if relayAddr.Port == 0 {
+		t.Error("BND.PORT is 0: RFC 1928 §7 requires the actual relay port")
+	}
+	if net.IP(relayAddr.IP).IsUnspecified() {
+		t.Errorf("BND.ADDR is all-zeros (%v): RFC 1928 §7 requires the interface address", relayAddr.IP)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TCP relay: idle timeout
+// ---------------------------------------------------------------------------
+
+// TestRelay_TCPIdleTimeout verifies that the TCP relay (relay.go idleReader)
+// tears down the connection when neither side sends data for TCPIdleTimeout.
+// The idle timeout is set to a very short value so the test completes quickly.
+func TestRelay_TCPIdleTimeout(t *testing.T) {
+	echo := startEchoServer(t)
+	defer echo.Close()
+
+	const idleTimeout = 150 * time.Millisecond
+	proxyAddr, cancel := startProxy(t, Config{
+		TCPIdleTimeout:           idleTimeout,
+		AllowPrivateDestinations: true,
+	})
+	defer cancel()
+
+	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
+
+	// Do NOT send anything — the relay must detect the idle condition.
+	// Allow 5× the idle timeout as wall-clock budget for scheduling jitter.
+	conn.SetReadDeadline(time.Now().Add(5 * idleTimeout))
+	_, err := conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected idle timeout to close the relay; Read succeeded unexpectedly")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UDP relay: idle timeout
+// ---------------------------------------------------------------------------
+
+// TestRelay_UDPIdleTimeout verifies that the UDP relay (runUDPRelay
+// pc.SetReadDeadline loop) tears down the association when no datagrams
+// arrive for UDPIdleTimeout. Because the association is linked to the TCP
+// control connection, the TCP side also closes when the relay exits.
+func TestRelay_UDPIdleTimeout(t *testing.T) {
+	const idleTimeout = 150 * time.Millisecond
+	proxyAddr, cancel := startProxy(t, Config{
+		UDPIdleTimeout: idleTimeout,
+	})
+	defer cancel()
+
+	ctrl, _ := doUDPAssociate(t, proxyAddr)
+
+	// Do NOT send any UDP datagrams. The relay's read deadline fires after
+	// idleTimeout and runUDPRelay returns, which causes handleUDPAssociate to
+	// return, which causes handle() to return and defer-close the TCP connection.
+	ctrl.SetReadDeadline(time.Now().Add(5 * idleTimeout))
+	_, err := ctrl.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected UDP idle timeout to close the TCP control connection")
 	}
 }

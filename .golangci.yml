@@ -1,0 +1,43 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck       # flag unchecked errors (primary motivation for _ = SetDeadline pattern)
+    - staticcheck    # comprehensive static analysis (supersedes golint)
+    - gosimple       # simplify code patterns
+    - govet          # report suspicious constructs (shadows, printf, etc.)
+    - ineffassign    # detect useless assignments
+    - unused         # detect unused code
+    - gosec          # security-oriented checks
+    - misspell       # catch common English misspellings in comments/docs
+    - gofmt          # enforce gofmt formatting
+    - goimports      # enforce import grouping / ordering
+    - revive         # fast, configurable linter replacing golint
+
+linters-settings:
+  errcheck:
+    # Blank-identifier discards documented with "_ =" are intentional.
+    check-blank: false
+  gosec:
+    excludes:
+      # G115: integer overflow on byte-length conversions — acceptable for
+      # SOCKS5 wire values whose maximum size is bounded by the protocol (255).
+      - G115
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - "checkPrivateReceivers"
+      - name: var-naming
+      - name: error-return
+      - name: increment-decrement
+
+issues:
+  exclude-rules:
+    # Test files are allowed to ignore net.Conn Write errors; a failed write
+    # in a test would surface as a subsequent read failure anyway.
+    - path: "_test\\.go"
+      linters:
+        - errcheck
+      text: "(Write|WriteTo)"

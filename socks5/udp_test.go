@@ -57,6 +57,34 @@ func TestAppendUDPResponse_IPv4MappedNormalised(t *testing.T) {
 	}
 }
 
+// TestAppendUDPResponse_ZeroAddr verifies that an invalid (zero) netip.AddrPort
+// produces ATYP=0x01 (IPv4) with address 0.0.0.0, matching the appendAddr
+// default case and the RFC 1928 §6 error-reply convention. This exercises the
+// default branch added by the appendUDPResponse refactor.
+func TestAppendUDPResponse_ZeroAddr(t *testing.T) {
+	var from netip.AddrPort // zero value: invalid addr, port 0
+	var dst [udpResponseBufSize]byte
+	n := appendUDPResponse(dst[:], from, []byte("data"))
+
+	if dst[3] != addrTypeIPv4 {
+		t.Fatalf("ATYP = %#x, want 0x01 (IPv4) for zero AddrPort", dst[3])
+	}
+	// Bytes 4-7: IPv4 address, must be 0.0.0.0
+	for i := 4; i <= 7; i++ {
+		if dst[i] != 0 {
+			t.Fatalf("addr byte[%d] = %#x, want 0x00 for zero addr", i, dst[i])
+		}
+	}
+	// Payload must follow immediately after the 10-byte IPv4 header.
+	const wantHeaderLen = 3 + 1 + 4 + 2 // RSV(2)+FRAG(1)+ATYP(1)+addr(4)+port(2)
+	if n != wantHeaderLen+4 {
+		t.Fatalf("total len = %d, want %d", n, wantHeaderLen+4)
+	}
+	if string(dst[wantHeaderLen:n]) != "data" {
+		t.Fatalf("payload = %q, want %q", dst[wantHeaderLen:n], "data")
+	}
+}
+
 // TestUDPHeaderRoundtrip verifies that appendUDPResponse and parseUDPHeader
 // are inverses of each other across all address families.
 func TestUDPHeaderRoundtrip(t *testing.T) {

@@ -39,6 +39,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 )
 
@@ -55,7 +56,7 @@ const (
 // handleUDPAssociate implements the SOCKS5 UDP ASSOCIATE command.
 // The authoritative client IP is taken from the TCP control connection;
 // the DST.ADDR hint in the request is intentionally ignored per RFC 1928 §7.
-func (s *session) handleUDPAssociate() {
+func (s *session) handleUDPAssociate(ctx context.Context) {
 	if !s.ap.Addr().IsValid() {
 		// Cannot enforce source-IP filtering without a known client IP.
 		// In practice this only happens in tests using net.Pipe.
@@ -78,7 +79,12 @@ func (s *session) handleUDPAssociate() {
 		gracefulClose(s.conn)
 		return
 	}
-	defer pc.Close()
+	// closePC ensures the PacketConn is closed exactly once regardless of
+	// whether the association ends via idle timeout, TCP-connection close,
+	// or server shutdown. Without Once, defer and the ctx goroutine race.
+	var once sync.Once
+	closePC := func() { once.Do(func() { pc.Close() }) }
+	defer closePC()
 
 	// Tell the client where to send UDP datagrams.
 	// BND.ADDR = TCP local IP (the interface the client reaches us on).
@@ -92,23 +98,22 @@ func (s *session) handleUDPAssociate() {
 
 	s.log.Info("UDP association started", "relay_port", relayPort)
 
-	// The association lives as long as the TCP control connection.
-	// io.Copy(io.Discard, …) blocks until the connection closes, then
-	// cancels the relay context.
-	ctx, cancel := context.WithCancel(context.Background())
+	// The association lives as long as both the TCP control connection and the
+	// server context. Either cancels assocCtx, which unblocks the relay.
+	assocCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go func() {
 		defer cancel()
 		io.Copy(io.Discard, s.conn) //nolint:errcheck
 	}()
-	// When ctx is cancelled, unblock ReadFrom by closing the relay socket.
+	// When assocCtx is cancelled, unblock ReadFrom by closing the relay socket.
 	go func() {
-		<-ctx.Done()
-		pc.Close()
+		<-assocCtx.Done()
+		closePC()
 	}()
 
-	runUDPRelay(ctx, pc, s.ap.Addr(), s.srv.resolver, s.log, s.srv.timeouts.udpIdle, s.srv.timeouts.dns)
+	runUDPRelay(assocCtx, pc, s.ap.Addr(), s.srv.resolver, s.log, s.srv.timeouts.udpIdle, s.srv.timeouts.dns)
 	s.log.Info("UDP association ended", "relay_port", relayPort)
 }
 

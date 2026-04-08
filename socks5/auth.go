@@ -47,30 +47,15 @@ func UserPassAuthMulti(credentials map[string]string) Authenticator {
 	return UserPassAuthenticator{Credentials: MapCredentials(credentials)}
 }
 
-// AuthInfo carries identity metadata from a completed authentication
-// sub-negotiation into the request pipeline. The concrete type is
-// method-specific; [RuleSet] implementations may type-assert to inspect it.
-type AuthInfo interface {
-	// Method returns the SOCKS5 method byte that produced this info.
-	Method() byte
-}
-
-// NoAuthInfo is the [AuthInfo] produced by [NoAuthAuthenticator].
-type NoAuthInfo struct{}
-
-func (NoAuthInfo) Method() byte { return methodNoAuth }
-
-// UserPassInfo is the [AuthInfo] produced by [UserPassAuthenticator] on success.
-// Username is available to [RuleSet] implementations via a type assertion.
-type UserPassInfo struct{ Username string }
-
-func (UserPassInfo) Method() byte { return methodUserPass }
-
 // Authenticator handles a single SOCKS5 authentication method.
 //
 // The server calls Authenticate only after it has written the method-selection
-// byte to the client, so implementations should perform only the
-// method-specific sub-negotiation (not the method selection itself).
+// byte to the client, so implementations perform only the method-specific
+// sub-negotiation (not the method selection itself).
+//
+// Authenticate returns the authenticated identity (e.g. username) on success,
+// or an empty string for anonymous methods such as NoAuth. The identity is
+// used for logging; the server closes the connection on any non-nil error.
 //
 // For username/password authentication, use [UserPassAuth] or
 // [UserPassAuthMulti] instead of implementing this interface.
@@ -78,9 +63,9 @@ type Authenticator interface {
 	// Code returns the SOCKS5 method byte this authenticator handles.
 	Code() byte
 	// Authenticate performs the method sub-negotiation on conn and returns
-	// [AuthInfo] on success, or an error that causes the server to close the
-	// connection.
-	Authenticate(conn net.Conn) (AuthInfo, error)
+	// the authenticated identity (username, token, etc.) on success, or an
+	// error that causes the server to close the connection.
+	Authenticate(conn net.Conn) (identity string, err error)
 }
 
 // NoAuthAuthenticator implements SOCKS5 method 0x00 (no authentication).
@@ -90,8 +75,8 @@ type NoAuthAuthenticator struct{}
 
 func (NoAuthAuthenticator) Code() byte { return methodNoAuth }
 
-func (NoAuthAuthenticator) Authenticate(_ net.Conn) (AuthInfo, error) {
-	return NoAuthInfo{}, nil
+func (NoAuthAuthenticator) Authenticate(_ net.Conn) (string, error) {
+	return "", nil // anonymous: no identity
 }
 
 // UserPassAuthenticator implements RFC 1929 username/password authentication
@@ -107,17 +92,13 @@ type UserPassAuthenticator struct {
 
 func (a UserPassAuthenticator) Code() byte { return methodUserPass }
 
-// Authenticate performs the RFC 1929 sub-negotiation and returns [UserPassInfo]
-// on success.
+// Authenticate performs the RFC 1929 sub-negotiation and returns the
+// authenticated username on success.
 //
 // Wire format — request:  VER(1) | ULEN(1) | UNAME(1-255) | PLEN(1) | PASSWD(1-255)
 // Wire format — response: VER(1) | STATUS(1)
-func (a UserPassAuthenticator) Authenticate(conn net.Conn) (AuthInfo, error) {
-	username, err := doUserPassAuth(conn, a.Credentials)
-	if err != nil {
-		return nil, err
-	}
-	return UserPassInfo{Username: username}, nil
+func (a UserPassAuthenticator) Authenticate(conn net.Conn) (string, error) {
+	return doUserPassAuth(conn, a.Credentials)
 }
 
 // CredentialStore validates username/password pairs.
@@ -135,8 +116,12 @@ type StaticCredentials struct {
 }
 
 func (s StaticCredentials) Valid(username, password string) bool {
-	return constantTimeEqual([]byte(username), []byte(s.Username)) &&
-		constantTimeEqual([]byte(password), []byte(s.Password))
+	// Assign both results before combining: if the && were applied directly
+	// to the two calls, the short-circuit would skip the password comparison
+	// when the username is wrong, leaking via timing whether the username exists.
+	userOK := constantTimeEqual([]byte(username), []byte(s.Username))
+	passOK := constantTimeEqual([]byte(password), []byte(s.Password))
+	return userOK && passOK
 }
 
 // MapCredentials is a multi-user [CredentialStore] backed by a username →
