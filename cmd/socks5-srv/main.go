@@ -12,6 +12,10 @@
 //
 // Send SIGHUP to reload the configuration without dropping active sessions.
 //
+// Send SIGUSR2 to perform a zero-downtime binary upgrade (Unix only).
+// The server re-executes the on-disk binary, passes the listening socket
+// to the new process, then drains active connections and exits.
+//
 // Usage:
 //
 //	socks5-srv [flags]
@@ -49,6 +53,7 @@ const defaultConfig = `# socks5-srv configuration
 # https://github.com/vadimpiven/socks5-srv
 #
 # Send SIGHUP to reload without dropping active sessions.
+# Send SIGUSR2 for a zero-downtime binary upgrade (Unix only).
 
 # Listen address (host:port).
 addr = ":1080"
@@ -105,6 +110,15 @@ func main() {
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
 
+	upgrade := upgradeSignal()
+
+	// Check for a listener inherited from a parent process (graceful upgrade).
+	ln, err := inheritListener()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	for {
 		srv, err := buildServer(cfg, logger)
 		if err != nil {
@@ -112,10 +126,12 @@ func main() {
 			os.Exit(1)
 		}
 
-		ln, err := net.Listen("tcp", cfg.Addr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
+		if ln == nil {
+			ln, err = net.Listen("tcp", cfg.Addr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		srvCtx, srvCancel := context.WithCancel(ctx)
@@ -124,10 +140,11 @@ func main() {
 			srvDone <- srv.Serve(srvCtx, ln)
 		}()
 
-		logger.Warn("listening", "addr", cfg.Addr)
+		signalReady() // tell parent (if any) that we are accepting
+		logger.Warn("listening", "addr", ln.Addr())
 
-		reloaded := false
-		for !reloaded {
+		action := ""
+		for action == "" {
 			select {
 			case <-ctx.Done():
 				srvCancel()
@@ -145,18 +162,35 @@ func main() {
 					break // re-enter select, keep running old config
 				}
 				cfg = newCfg
-				reloaded = true
+				action = "reload"
+			case <-upgrade:
+				if err := startUpgrade(ln, logger); err != nil {
+					logger.Error("upgrade failed", "err", err)
+					break // re-enter select, keep running
+				}
+				action = "upgrade"
 			}
 		}
 
-		// Stop accepting new connections; drain active sessions in background.
+		// Stop accepting new connections.
 		ln.Close()
-		go func(cancel context.CancelFunc, done <-chan error) {
-			<-done
-			cancel()
-		}(srvCancel, srvDone)
+		ln = nil
 
-		logger.Warn("configuration reloaded")
+		switch action {
+		case "reload":
+			// Drain active sessions in background while new config takes effect.
+			go func(cancel context.CancelFunc, done <-chan error) {
+				<-done
+				cancel()
+			}(srvCancel, srvDone)
+			logger.Warn("configuration reloaded")
+		case "upgrade":
+			// Wait for all active sessions to finish, then exit.
+			logger.Warn("upgrade: draining active connections")
+			<-srvDone
+			srvCancel()
+			return
+		}
 	}
 }
 

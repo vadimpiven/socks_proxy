@@ -1,6 +1,6 @@
 # Compiled binary
-socks5-srv
-socks5-srv.exe
+/socks5-srv
+/socks5-srv.exe
 
 # Test binaries built with `go test -c`
 *.test
