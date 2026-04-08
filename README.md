@@ -14,7 +14,7 @@ Lightweight, embeddable SOCKS5 proxy server in Go implementing:
 | Concurrency       | Configurable max connections (default 1024)           |
 | Graceful shutdown | Drains active sessions before exit                    |
 | Hot reload        | SIGHUP reloads config; active sessions stay open      |
-| Platforms         | Linux, macOS (CLI hot reload requires Unix signals)   |
+| Platforms         | Linux, macOS, Windows (hot reload is Unix-only)       |
 
 Out of scope (will not be implemented):
 
