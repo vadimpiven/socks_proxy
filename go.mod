@@ -4,5 +4,5 @@ go 1.26
 
 require (
 	github.com/pelletier/go-toml/v2 v2.3.0
-	golang.org/x/net v0.52.0
+	golang.org/x/net v0.55.0
 )
